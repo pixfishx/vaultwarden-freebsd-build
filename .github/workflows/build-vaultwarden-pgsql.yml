@@ -69,12 +69,15 @@ jobs:
             export IGNORE_OSVERSION=yes
             export ASSUME_ALWAYS_YES=yes
             pkg update -f
-            # perl5 是编译 vendored OpenSSL 源码所必需（openssl-src 的 Configure 是 perl 脚本）
+            # vendored_openssl 从源码编译 OpenSSL 需要：
+            #   perl5  - OpenSSL 的 Configure 是 perl 脚本
+            #   gmake  - OpenSSL 构建系统用 GNU make（FreeBSD 默认是 bmake，必须装 gmake）
             pkg install -y \
               git \
               rust \
               pkgconf \
-              perl5
+              perl5 \
+              gmake
             pkg install -y postgresql18-client || \
               pkg install -y postgresql17-client || \
               pkg install -y postgresql16-client || \
