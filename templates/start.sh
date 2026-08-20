@@ -4,7 +4,7 @@ cd "$DIR"
 
 # 二进制必须存在
 if [ ! -x "$DIR/vaultwarden" ]; then
-  echo "错误: 未找到 $DIR/vaultwarden" >&2
+  echo "ERROR: 未找到 $DIR/vaultwarden" >&2
   exit 1
 fi
 
@@ -12,7 +12,7 @@ fi
 if [ -f ./.env ]; then
   set -a; . ./.env; set +a
 else
-  echo "警告: 未找到 .env，请先 cp .env.example .env 并填写" >&2
+  echo "WARNING: 未找到 .env，请先 cp .env.example .env 并填写" >&2
 fi
 
 # 运行环境：优先自带 lib/，系统库兜底
@@ -41,11 +41,11 @@ echo $NEW_PID > "$DIR/vaultwarden.pid"
 # 等 2 秒确认进程存活（启动即崩溃时报错而不是假装成功）
 sleep 2
 if ! kill -0 "$NEW_PID" 2>/dev/null; then
-  echo "错误: Vaultwarden 启动后立即退出，请查看日志:" >&2
+  echo "ERROR: Vaultwarden 启动后立即退出，请查看日志:" >&2
   tail -n 20 "$DIR/logs/vaultwarden.log" >&2 || true
   rm -f "$DIR/vaultwarden.pid"
   exit 1
 fi
 
 echo "Vaultwarden started, PID: $NEW_PID"
-echo "日志: $DIR/logs/vaultwarden.log"
+echo "LOG: $DIR/logs/vaultwarden.log"
