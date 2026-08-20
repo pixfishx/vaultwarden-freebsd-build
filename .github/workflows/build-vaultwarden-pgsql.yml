@@ -1,0 +1,205 @@
+name: Build Vaultwarden FreeBSD PostgreSQL
+
+on:
+  workflow_dispatch:
+  # 每 6 小时检查一次上游 dani-garcia/vaultwarden 是否有新 release
+  schedule:
+    - cron: "0 */6 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  # 第一步：检查上游是否有新版本需要构建
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.latest.outputs.version }}
+      need_build: ${{ steps.check_existing.outputs.need_build }}
+    steps:
+      - name: Get latest upstream vaultwarden release
+        id: latest
+        run: |
+          # 获取 dani-garcia/vaultwarden 最新 release 的 tag（如 v1.33.2）
+          LATEST=$(curl -sL \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/dani-garcia/vaultwarden/releases/latest \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('tag_name',''))")
+          echo "Latest upstream version: $LATEST"
+          [ -n "$LATEST" ] || { echo "Failed to get latest version"; exit 1; }
+          echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "version=$LATEST" >> "$GITHUB_ENV"
+
+      - name: Check if version already published
+        id: check_existing
+        run: |
+          LATEST="${{ steps.latest.outputs.version }}"
+          # 查询自己仓库是否已有同名的 Release
+          EXISTING=$(curl -sL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "$GITHUB_API_URL/repos/${{ github.repository }}/releases/tags/$LATEST" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('tag_name',''))" 2>/dev/null || true)
+          if [ -n "$EXISTING" ]; then
+            echo "Version $LATEST already published, skipping."
+            echo "need_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New version $LATEST found, building."
+            echo "need_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # 第二步：构建（仅当上游有新版本时）
+  build:
+    needs: check
+    if: needs.check.outputs.need_build == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.4"
+          usesh: true
+          mem: 8192
+
+          prepare: |
+            export IGNORE_OSVERSION=yes
+            export ASSUME_ALWAYS_YES=yes
+            pkg update -f
+            # perl5 是编译 vendored OpenSSL 源码所必需（openssl-src 的 Configure 是 perl 脚本）
+            pkg install -y \
+              git \
+              rust \
+              pkgconf \
+              perl5
+            pkg install -y postgresql18-client || \
+              pkg install -y postgresql17-client || \
+              pkg install -y postgresql16-client || \
+              pkg install -y postgresql-client
+
+          run: |
+            set -e
+            WORKSPACE="${GITHUB_WORKSPACE:-$(pwd)}"
+            VERSION="${{ needs.check.outputs.version }}"
+
+            # 克隆指定版本（tag）的 vaultwarden 源码
+            git clone --depth 1 --branch "$VERSION" \
+              https://github.com/dani-garcia/vaultwarden.git /tmp/vaultwarden-src
+            cd /tmp/vaultwarden-src
+
+            mkdir -p .cargo
+            printf '%s\n' \
+              '[target.x86_64-unknown-freebsd]' \
+              'rustflags = ["-C", "link-arg=-Wl,-z,origin", "-C", "link-arg=-Wl,-rpath,$ORIGIN/lib"]' \
+              > .cargo/config.toml
+
+            # vendored_openssl: 将 OpenSSL 静态编译进二进制，
+            # 使产物不再动态依赖 libssl/libcrypto（serv00 系统自带 .30 也不冲突）
+            cargo build \
+              --release \
+              --no-default-features \
+              --features postgresql,vendored_openssl
+
+            strip --strip-unneeded target/release/vaultwarden || \
+              strip target/release/vaultwarden
+
+            mkdir -p "$WORKSPACE/out/lib"
+            cp -f target/release/vaultwarden "$WORKSPACE/out/vaultwarden"
+            chmod 755 "$WORKSPACE/out/vaultwarden"
+
+            # 部署模板：.env.example + start.sh / stop.sh / status.sh
+            # 模板文件来自仓库 templates/ 目录，随 checkout 带入
+            cp -f "$WORKSPACE/templates/.env.example" "$WORKSPACE/out/.env.example"
+            cp -f "$WORKSPACE/templates/start.sh" "$WORKSPACE/out/start.sh"
+            cp -f "$WORKSPACE/templates/stop.sh" "$WORKSPACE/out/stop.sh"
+            cp -f "$WORKSPACE/templates/status.sh" "$WORKSPACE/out/status.sh"
+            chmod 755 "$WORKSPACE/out/start.sh" "$WORKSPACE/out/stop.sh" "$WORKSPACE/out/status.sh"
+
+            # 递归拷贝动态依赖中 serv00 系统没有的库
+            # serv00 系统自带: libc/libm/libthr/libgcc_s (base), libssl.so.30/libcrypto.so.30 (base), libintl.so.8
+            # 所以排除这些，只保留 libpq 及真正缺失的依赖
+            copy_deps() {
+              file="$1"
+              ldd "$file" | awk '/=> \/usr\/local\// {print $3}' | while read dep; do
+                [ -e "$dep" ] || continue
+                base="$(basename "$dep")"
+                # 排除 serv00 系统已自带的基础库
+                case "$base" in
+                  libc.so.*|libm.so.*|libthr.so.*|libgcc_s.so.*|libintl.so.*|libssl.so.*|libcrypto.so.*)
+                    echo "skip (system provides): $base"
+                    continue
+                    ;;
+                esac
+                dest="$WORKSPACE/out/lib/$base"
+                if [ ! -e "$dest" ]; then
+                  cp -f "$dep" "$dest"
+                  copy_deps "$dep"
+                fi
+              done
+            }
+
+            echo "=== ldd vaultwarden (before copy) ==="
+            ldd "$WORKSPACE/out/vaultwarden"
+            copy_deps "$WORKSPACE/out/vaultwarden"
+
+            echo "=== out/ contents ==="
+            ls -lh "$WORKSPACE/out" "$WORKSPACE/out/lib"
+            # 直接运行二进制验证（不依赖 .env）
+            LD_LIBRARY_PATH="$WORKSPACE/out/lib:/usr/local/lib:/usr/lib:/lib" \
+              "$WORKSPACE/out/vaultwarden" --version
+
+      - name: Check
+        run: |
+          ls -lh out/vaultwarden out/lib
+          file out/vaultwarden
+          test -f out/vaultwarden
+          # 三个管理脚本 + .env 模板必须存在
+          test -f out/start.sh
+          test -f out/stop.sh
+          test -f out/status.sh
+          test -f out/.env.example
+          # FreeBSD 二进制不能在 ubuntu 上直接执行，用 file 检查架构即可
+          file out/vaultwarden | grep -i "freebsd\|x86-64"
+          # libpq 必须带上（serv00 系统没有）
+          test -f out/lib/libpq.so.5
+          # 记录最终外挂库清单
+          echo "=== Final bundled libs ==="
+          ls out/lib/
+
+      - name: Package zip
+        run: |
+          VERSION="${{ needs.check.outputs.version }}"
+          # 版本号去掉开头的 v（如 v1.33.2 -> 1.33.2）用于文件名
+          FILE_VERSION="${VERSION#v}"
+          echo "Package filename: vaultwarden-${FILE_VERSION}-pgsql.zip"
+          mkdir -p release
+          cp -r out release/vaultwarden-${FILE_VERSION}-pgsql
+          cd release
+          zip -r "vaultwarden-${FILE_VERSION}-pgsql.zip" "vaultwarden-${FILE_VERSION}-pgsql"
+          cd ..
+          # 保存实际文件名供后续使用
+          echo "version=$VERSION" >> "$GITHUB_ENV"
+          echo "file_version=$FILE_VERSION" >> "$GITHUB_ENV"
+          ls -lh release/
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check.outputs.version }}
+          name: Vaultwarden ${{ needs.check.outputs.version }} (FreeBSD PostgreSQL)
+          files: release/vaultwarden-${{ env.file_version }}-pgsql.zip
+          generate_release_notes: false
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaultwarden-${{ env.file_version }}-pgsql
+          path: out/
+          if-no-files-found: error

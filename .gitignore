@@ -1,0 +1,18 @@
+# 敏感文件：绝不能上传（含 ADMIN_TOKEN）
+.env
+*.env
+
+# 运行时数据
+data/
+logs/
+*.pid
+
+# 下载的官方 pkg 包（体积大，不需要进 git）
+*.pkg
+*.txz
+
+# 解包目录
+pkg-extract/
+
+# 本地分析用临时目录
+_analysis/
