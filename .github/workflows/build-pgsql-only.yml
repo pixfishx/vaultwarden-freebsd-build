@@ -1,0 +1,107 @@
+name: Build Vaultwarden FreeBSD PostgreSQL
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.4"
+          usesh: true
+          mem: 8192
+
+          prepare: |
+            export IGNORE_OSVERSION=yes
+            export ASSUME_ALWAYS_YES=yes
+            pkg update -f
+            pkg install -y \
+              git \
+              rust \
+              pkgconf \
+              openssl
+            pkg install -y postgresql-client || \
+              pkg install -y postgresql17-client || \
+              pkg install -y postgresql16-client
+
+            export OPENSSL_DIR=/usr/local
+            export OPENSSL_LIB_DIR=/usr/local/lib
+            export OPENSSL_INCLUDE_DIR=/usr/local/include
+
+          run: |
+            set -e
+            WORKSPACE="${GITHUB_WORKSPACE:-$(pwd)}"
+
+            export OPENSSL_DIR=/usr/local
+            export OPENSSL_LIB_DIR=/usr/local/lib
+            export OPENSSL_INCLUDE_DIR=/usr/local/include
+
+            git clone --depth 1 https://github.com/dani-garcia/vaultwarden.git /tmp/vaultwarden-src
+            cd /tmp/vaultwarden-src
+
+            mkdir -p .cargo
+            printf '%s\n' \
+              '[target.x86_64-unknown-freebsd]' \
+              'rustflags = ["-C", "link-arg=-Wl,-z,origin", "-C", "link-arg=-Wl,-rpath,$ORIGIN/lib"]' \
+              > .cargo/config.toml
+
+            cargo build \
+              --release \
+              --no-default-features \
+              --features postgresql
+
+            strip --strip-unneeded target/release/vaultwarden || \
+              strip target/release/vaultwarden
+
+            mkdir -p "$WORKSPACE/out/lib"
+            cp -f target/release/vaultwarden "$WORKSPACE/out/vaultwarden"
+            chmod 755 "$WORKSPACE/out/vaultwarden"
+
+            printf '%s\n' \
+              '#!/bin/sh' \
+              'DIR=$(cd "$(dirname "$0")" && pwd)' \
+              'export LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' \
+              'exec "$DIR/vaultwarden" "$@"' \
+              > "$WORKSPACE/out/run.sh"
+            chmod 755 "$WORKSPACE/out/run.sh"
+
+            copy_deps() {
+              file="$1"
+              ldd "$file" | awk '/=> \/usr\/local\// {print $3}' | while read dep; do
+                [ -e "$dep" ] || continue
+                dest="$WORKSPACE/out/lib/$(basename "$dep")"
+                if [ ! -e "$dest" ]; then
+                  cp -f "$dep" "$dest"
+                  copy_deps "$dep"
+                fi
+              done
+            }
+
+            ldd "$WORKSPACE/out/vaultwarden"
+            copy_deps "$WORKSPACE/out/vaultwarden"
+
+            ls -lh "$WORKSPACE/out" "$WORKSPACE/out/lib"
+            "$WORKSPACE/out/run.sh" --version
+
+      - name: Check
+        run: |
+          ls -lh out/vaultwarden out/lib
+          file out/vaultwarden
+          test -f out/vaultwarden
+          test -f out/run.sh
+          test -f out/lib/libpq.so.5
+          ls out/lib/libssl.so.*
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaultwarden-freebsd-pgsql
+          path: out/
+          if-no-files-found: error
