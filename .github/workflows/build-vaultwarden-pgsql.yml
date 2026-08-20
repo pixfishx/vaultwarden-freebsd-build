@@ -179,9 +179,10 @@ jobs:
           FILE_VERSION="${VERSION#v}"
           echo "Package filename: vaultwarden-${FILE_VERSION}-pgsql.zip"
           mkdir -p release
-          cp -r out release/vaultwarden-${FILE_VERSION}-pgsql
-          cd release
-          zip -r "vaultwarden-${FILE_VERSION}-pgsql.zip" "vaultwarden-${FILE_VERSION}-pgsql"
+          # 直接压缩 out/ 内容，zip 内不包含多余的外层文件夹
+          # （进入 out/ 后用 . 压缩，会包含 .env.example 等隐藏文件）
+          cd out
+          zip -r "../release/vaultwarden-${FILE_VERSION}-pgsql.zip" .
           cd ..
           # 保存实际文件名供后续使用
           echo "version=$VERSION" >> "$GITHUB_ENV"
